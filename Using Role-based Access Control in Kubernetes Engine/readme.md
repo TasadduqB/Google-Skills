@@ -20,6 +20,7 @@ chmod +x Script.sh
 ./Script.sh
 ```
 
+
 ## Easy Way
 
-##1. Copy Paste Entire Content of the Script.sh in the terminal and hit "Enter"
+## 1. Copy Paste Entire Content of the Script.sh in the terminal and hit "Enter"
