@@ -1,42 +1,69 @@
-cat << 'EOF' > complete_harden_lab.sh
+cat << 'EOF' > auto_harden_lab.sh
 #!/bin/bash
 
 # ==============================================================================
 # GSP496: Hardening Default GKE Cluster Configurations
-# COMPLETE AUTOMATED SOLUTION
+# FULLY AUTOMATED & DYNAMIC
 # ==============================================================================
 
-# Exit immediately if a command exits with a non-zero status.
+# Fail on error
 set -e
 
-# --- Configuration ---
-export MY_ZONE=us-central1-c
-export CLUSTER_NAME=simplecluster
+echo "========================================================"
+echo "    DETECTING LAB CONFIGURATION"
+echo "========================================================"
+
+# 1. Auto-Detect Project ID
 export PROJECT_ID=$(gcloud config get-value project)
-# Dynamically fetch the "Student" email to ensure we aren't using a Service Account
-export USER_ACCOUNT=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" | grep "student" | head -n 1)
+
+# 2. Auto-Detect Assigned Zone
+# Attempt 1: Check if a default zone is already set in gcloud config
+echo "Detecting assigned zone..."
+export MY_ZONE=$(gcloud config get-value compute/zone 2>/dev/null)
+
+# Attempt 2: If config is unset, check Project Metadata (Standard for Qwiklabs)
+if [ -z "$MY_ZONE" ] || [ "$MY_ZONE" == "(unset)" ]; then
+  echo "Zone not in config. Checking project metadata..."
+  MY_ZONE=$(gcloud compute project-info describe --format="value(commonInstanceMetadata.items.google-compute-default-zone)" 2>/dev/null)
+  # Clean up the output if it returns a full URL (e.g. projects/.../zones/...)
+  MY_ZONE=${MY_ZONE##*/}
+fi
+
+# Attempt 3: If still empty, find the first available US-Central or US-East zone
+if [ -z "$MY_ZONE" ] || [ "$MY_ZONE" == "(unset)" ]; then
+  echo "Metadata empty. Fetching first available zone..."
+  MY_ZONE=$(gcloud compute zones list --filter="region:(us-central1 us-east1)" --limit=1 --format="value(name)")
+fi
+
+# 3. Auto-Detect Admin User (Student Email)
+# We grep for 'student' or 'google' to avoid picking service accounts
+export USER_ACCOUNT=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" | grep -E "student|google" | head -n 1)
+export CLUSTER_NAME=simplecluster
 export SA_NAME=demo-developer
 
-echo "========================================================"
-echo "Initializing Lab Automation"
-echo "Project: $PROJECT_ID"
-echo "Zone:    $MY_ZONE"
-echo "User:    $USER_ACCOUNT"
-echo "========================================================"
+echo "--------------------------------------------------------"
+echo "Project:  $PROJECT_ID"
+echo "Zone:     $MY_ZONE"
+echo "User:     $USER_ACCOUNT"
+echo "--------------------------------------------------------"
 
-# Ensure we are running as the Admin User (fixes IAM permission errors)
-gcloud config set account $USER_ACCOUNT
+if [ -z "$MY_ZONE" ]; then
+  echo "ERROR: Could not detect a valid zone. Please set it manually using: export MY_ZONE=your-zone"
+  exit 1
+fi
 
 # ==============================================================================
 # Task 1: Create GKE Cluster
 # ==============================================================================
-echo "[Task 1] Creating GKE Cluster (Approx 4-5 mins)..."
-# We use '|| true' to allow the script to continue if the cluster already exists
+echo "[Task 1] Creating GKE Cluster in $MY_ZONE..."
+
+
+# We remove the disk-size restriction to use defaults, unless quota issues arise
 gcloud container clusters create $CLUSTER_NAME \
     --zone $MY_ZONE \
     --num-nodes 2 \
     --metadata=disable-legacy-endpoints=false \
-    --quiet || echo "Cluster may already exist, proceeding..."
+    --quiet || echo "Cluster might already exist. Proceeding..."
 
 echo "[Task 1] Authenticating..."
 gcloud container clusters get-credentials $CLUSTER_NAME --zone $MY_ZONE
@@ -45,7 +72,6 @@ gcloud container clusters get-credentials $CLUSTER_NAME --zone $MY_ZONE
 # Task 2: Metadata Exploration (Vulnerable State)
 # ==============================================================================
 echo "[Task 2] Launching gcloud-sdk pod..."
-# Delete if exists from previous run
 kubectl delete pod gcloud --ignore-not-found=true --now
 
 kubectl run gcloud --image=google/cloud-sdk:latest --restart=Never --command -- sleep 3600
@@ -67,6 +93,7 @@ kubectl delete pod gcloud --now
 # Task 3: Hostpath Vulnerability
 # ==============================================================================
 echo "[Task 3] Deploying vulnerable 'hostpath' pod..."
+
 kubectl delete pod hostpath --ignore-not-found=true --now
 
 cat <<YAML | kubectl apply -f -
@@ -101,14 +128,14 @@ kubectl delete pod hostpath --now
 # ==============================================================================
 # Task 5: Hardened Node Pool
 # ==============================================================================
-echo "[Task 5] Creating Hardened Node Pool..."
+echo "[Task 5] Creating Hardened Node Pool in $MY_ZONE..."
 gcloud beta container node-pools create second-pool \
     --cluster=$CLUSTER_NAME \
     --zone=$MY_ZONE \
     --num-nodes=1 \
     --metadata=disable-legacy-endpoints=true \
     --workload-metadata-from-node=SECURE \
-    --quiet || echo "Node pool likely exists, proceeding..."
+    --quiet || echo "Node pool might already exist. Proceeding..."
 
 # ==============================================================================
 # Task 6: Verify Hardening
@@ -133,7 +160,8 @@ kubectl delete pod gcloud-secure --now
 # ==============================================================================
 echo "[Task 7] Setting up Pod Security Policies..."
 
-# Grant cluster-admin to current user
+
+# Ensure we use the Admin User Account detected earlier
 kubectl create clusterrolebinding clusteradmin \
     --clusterrole=cluster-admin \
     --user="$USER_ACCOUNT" || true
@@ -141,7 +169,7 @@ kubectl create clusterrolebinding clusteradmin \
 # Enforce restricted profile
 kubectl label namespace default pod-security.kubernetes.io/enforce=restricted --overwrite
 
-# Create ClusterRole & Binding (Ignore errors if they already exist)
+# Create ClusterRole & Binding (Ignore if exists)
 cat <<YAML | kubectl apply -f - || true
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -201,7 +229,6 @@ gcloud auth activate-service-account --key-file=key.json --quiet
 gcloud container clusters get-credentials $CLUSTER_NAME --zone $MY_ZONE
 
 echo "  -> Attempting to deploy VIOLATING pod (Expect Forbidden Error)..."
-# Expect failure
 cat <<YAML | kubectl apply -f - || true
 apiVersion: v1
 kind: Pod
@@ -223,7 +250,6 @@ spec:
 YAML
 
 echo "  -> Deploying COMPLIANT pod (Expect Success)..."
-# Ensure unique name to avoid cleanup conflicts
 cat <<YAML | kubectl apply -f -
 apiVersion: v1
 kind: Pod
@@ -254,5 +280,5 @@ echo "LAB COMPLETE - ALL TASKS FINISHED"
 echo "========================================================"
 EOF
 
-chmod +x complete_harden_lab.sh
-./complete_harden_lab.sh
+chmod +x auto_harden_lab.sh
+./auto_harden_lab.sh
