@@ -3,7 +3,7 @@ cat << 'EOF' > complete_harden_lab.sh
 
 # ==============================================================================
 # GSP496: Hardening Default GKE Cluster Configurations
-# COMPLETE AUTOMATED SOLUTION (With Fixes)
+# COMPLETE SOLUTION (With Propagation Fixes)
 # ==============================================================================
 
 # Fail on error
@@ -17,26 +17,22 @@ echo "========================================================"
 export PROJECT_ID=$(gcloud config get-value project)
 
 # 2. Auto-Detect Assigned Zone
-# Attempt 1: Check if a default zone is already set in gcloud config
-echo "Detecting assigned zone..."
+# Attempt 1: Check gcloud config
 export MY_ZONE=$(gcloud config get-value compute/zone 2>/dev/null)
 
-# Attempt 2: If config is unset, check Project Metadata (Standard for Qwiklabs)
+# Attempt 2: Check Metadata (common in Qwiklabs)
 if [ -z "$MY_ZONE" ] || [ "$MY_ZONE" == "(unset)" ]; then
-  echo "Zone not in config. Checking project metadata..."
   MY_ZONE=$(gcloud compute project-info describe --format="value(commonInstanceMetadata.items.google-compute-default-zone)" 2>/dev/null)
-  # Clean up the output if it returns a full URL
   MY_ZONE=${MY_ZONE##*/}
 fi
 
-# Attempt 3: If still empty, default to us-east1-c (since Central is often blocked)
+# Attempt 3: Default fallback
 if [ -z "$MY_ZONE" ] || [ "$MY_ZONE" == "(unset)" ]; then
-  echo "Metadata empty. Defaulting to us-east1-c..."
+  echo "Zone detection failed. Defaulting to us-east1-c..."
   MY_ZONE="us-east1-c"
 fi
 
 # 3. Auto-Detect Admin User (Student Email)
-# We grep for 'student' or 'google' to avoid picking service accounts
 export ADMIN_USER=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" | grep -E "student|google" | head -n 1)
 
 # Ensure we are running as the Admin User
@@ -57,7 +53,6 @@ echo "--------------------------------------------------------"
 echo "[Task 1] Creating GKE Cluster in $MY_ZONE..."
 
 
-# Use quiet mode, but if it fails (already exists), echo a message and continue
 gcloud container clusters create $CLUSTER_NAME \
     --zone $MY_ZONE \
     --num-nodes 2 \
@@ -201,7 +196,7 @@ roleRef:
 YAML
 
 # ==============================================================================
-# Task 8: Test Enforcement with Service Account (FIXED)
+# Task 8: Test Enforcement (WITH FIXES)
 # ==============================================================================
 echo "[Task 8] Setting up Service Account for Verification..."
 
@@ -211,7 +206,7 @@ gcloud iam service-accounts delete "${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount
 echo "Creating Service Account..."
 gcloud iam service-accounts create $SA_NAME --display-name="Demo Developer" --quiet
 
-# *** CRITICAL FIX: WAIT FOR ACCOUNT PROPAGATION ***
+# *** FIX 1: WAIT FOR ACCOUNT PROPAGATION ***
 echo "Waiting 20s for Account Propagation..."
 for i in {20..1}; do echo -ne "$i..."'\r'; sleep 1; done
 echo ""
@@ -222,16 +217,22 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --member="serviceAccount:${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
     --quiet
 
-# *** CRITICAL FIX: WAIT FOR ROLE PROPAGATION ***
-echo "Waiting 20s for Role Propagation..."
-for i in {20..1}; do echo -ne "$i..."'\r'; sleep 1; done
+# *** FIX 2: WAIT FOR ROLE PROPAGATION ***
+echo "Waiting 15s for Role Propagation..."
+for i in {15..1}; do echo -ne "$i..."'\r'; sleep 1; done
 echo ""
 
 # Clean keys
 rm -f key.json
+echo "Creating Keys..."
 gcloud iam service-accounts keys create key.json \
     --iam-account "${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
     --quiet
+
+# *** FIX 3: WAIT FOR KEY VALIDITY (FIXES JWT ERROR) ***
+echo "Waiting 45s for Key Validity..."
+for i in {45..1}; do echo -ne "$i..."'\r'; sleep 1; done
+echo ""
 
 # Authenticate as SA
 gcloud auth activate-service-account --key-file=key.json --quiet
