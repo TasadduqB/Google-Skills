@@ -1,91 +1,96 @@
-cat << 'EOF' > complete_harden_lab.sh
+cat << 'EOF' > final_harden_fix.sh
 #!/bin/bash
 
 # ==============================================================================
 # GSP496: Hardening Default GKE Cluster Configurations
-# COMPLETE SOLUTION (With Propagation Fixes)
+# DYNAMIC ZONE + STATE RESET + ROBUST ERROR HANDLING
 # ==============================================================================
 
 # Fail on error
 set -e
 
 echo "========================================================"
-echo "    DETECTING LAB CONFIGURATION"
+echo "    INITIALIZING AUTOMATION"
 echo "========================================================"
 
-# 1. Auto-Detect Project ID
-export PROJECT_ID=$(gcloud config get-value project)
+# 1. ROBUST ADMIN USER DETECTION
+# We list ALL accounts, exclude service accounts, and grab the student email.
+export ADMIN_USER=$(gcloud auth list --format="value(account)" | grep -v "iam.gserviceaccount.com" | grep -E "student|qwiklabs|google" | head -n 1)
 
-# 2. Auto-Detect Assigned Zone
-# Attempt 1: Check gcloud config
-export MY_ZONE=$(gcloud config get-value compute/zone 2>/dev/null)
-
-# Attempt 2: Check Metadata (common in Qwiklabs)
-if [ -z "$MY_ZONE" ] || [ "$MY_ZONE" == "(unset)" ]; then
-  MY_ZONE=$(gcloud compute project-info describe --format="value(commonInstanceMetadata.items.google-compute-default-zone)" 2>/dev/null)
-  MY_ZONE=${MY_ZONE##*/}
+if [ -z "$ADMIN_USER" ]; then
+    echo "CRITICAL ERROR: Could not detect Student/Admin account."
+    exit 1
 fi
 
-# Attempt 3: Default fallback
-if [ -z "$MY_ZONE" ] || [ "$MY_ZONE" == "(unset)" ]; then
-  echo "Zone detection failed. Defaulting to us-east1-c..."
-  MY_ZONE="us-east1-c"
-fi
-
-# 3. Auto-Detect Admin User (Student Email)
-export ADMIN_USER=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" | grep -E "student|google" | head -n 1)
-
-# Ensure we are running as the Admin User
+echo "Detected Admin User: $ADMIN_USER"
+echo "Switching to Admin Context..."
 gcloud config set account $ADMIN_USER
 
+# 2. DYNAMIC CONFIGURATION
+export PROJECT_ID=$(gcloud config get-value project)
 export CLUSTER_NAME=simplecluster
 export SA_NAME=demo-developer
 
-echo "--------------------------------------------------------"
-echo "Project:  $PROJECT_ID"
-echo "Zone:     $MY_ZONE"
-echo "User:     $ADMIN_USER"
-echo "--------------------------------------------------------"
-
 # ==============================================================================
-# Task 1: Create GKE Cluster
+# PHASE 1: DYNAMIC CLUSTER & ZONE DETECTION
 # ==============================================================================
-echo "[Task 1] Creating GKE Cluster in $MY_ZONE..."
+echo "--------------------------------------------------------"
+echo "Locating Cluster..."
+
+# Check if cluster already exists in ANY zone
+DETECTED_ZONE=$(gcloud container clusters list --filter="name:$CLUSTER_NAME" --format="value(location)" 2>/dev/null | head -n 1)
+
+if [ -n "$DETECTED_ZONE" ]; then
+  echo "Found existing cluster in: $DETECTED_ZONE"
+  export MY_ZONE=$DETECTED_ZONE
+else
+  echo "Cluster not found. Attempting creation..."
+  # Try zones sequentially to handle quotas
+  ZONES=("us-central1-c" "us-east1-c" "us-west1-c" "us-central1-a" "us-east1-b")
+  
+  for ZONE in "${ZONES[@]}"; do
+    echo "Attempting creation in $ZONE..."
+    if gcloud container clusters create $CLUSTER_NAME --zone $ZONE --num-nodes 2 --metadata=disable-legacy-endpoints=false --quiet; then
+      export MY_ZONE=$ZONE
+      echo "SUCCESS: Cluster created in $MY_ZONE"
+      break
+    else
+      echo "Failed in $ZONE. Trying next..."
+    fi
+  done
+  
+  if [ -z "$MY_ZONE" ]; then
+    echo "ERROR: Could not create cluster. Region quotas might be full."
+    exit 1
+  fi
+fi
+
+echo "Target Zone: $MY_ZONE"
 
 
-gcloud container clusters create $CLUSTER_NAME \
-    --zone $MY_ZONE \
-    --num-nodes 2 \
-    --metadata=disable-legacy-endpoints=false \
-    --quiet || echo "Cluster might already exist. Proceeding..."
-
-echo "[Task 1] Authenticating..."
+# Authenticate
 gcloud container clusters get-credentials $CLUSTER_NAME --zone $MY_ZONE
 
+# *** CRITICAL FIX: RESET NAMESPACE SECURITY ***
+# If the lab was run before, the 'restricted' policy might be active, blocking Task 2.
+# We remove it now so we can demonstrate the vulnerabilities.
+echo "Resetting Namespace Policy (Allowing Vulnerable Pods)..."
+kubectl label namespace default pod-security.kubernetes.io/enforce- --overwrite || true
+
 # ==============================================================================
-# Task 2: Metadata Exploration (Vulnerable State)
+# PHASE 2: VULNERABILITY SIMULATION (Tasks 2-4)
 # ==============================================================================
 echo "[Task 2] Launching gcloud-sdk pod..."
 kubectl delete pod gcloud --ignore-not-found=true --now
 
 kubectl run gcloud --image=google/cloud-sdk:latest --restart=Never --command -- sleep 3600
-echo "Waiting for pod to be Ready..."
+echo "Waiting for pod..."
 kubectl wait --for=condition=Ready pod/gcloud --timeout=120s
-
-echo "  -> Attempting Metadata Access (Expect Failure)..."
-kubectl exec gcloud -- curl -s http://metadata.google.internal/computeMetadata/v1/instance/name || true
-
-echo "  -> Accessing with Header (Expect Success)..."
-kubectl exec gcloud -- curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/name
 
 echo "  -> Exfiltrating kube-env (Sensitive Data)..."
 kubectl exec gcloud -- curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/attributes/kube-env | head -n 5
-
 kubectl delete pod gcloud --now
 
-# ==============================================================================
-# Task 3: Hostpath Vulnerability
-# ==============================================================================
 echo "[Task 3] Deploying vulnerable 'hostpath' pod..."
 
 kubectl delete pod hostpath --ignore-not-found=true --now
@@ -109,34 +114,27 @@ spec:
     hostPath:
       path: /
 YAML
-
 kubectl wait --for=condition=Ready pod/hostpath --timeout=60s
 
-# ==============================================================================
-# Task 4: Host Compromise Simulation
-# ==============================================================================
 echo "[Task 4] Verifying Host Filesystem Access..."
 kubectl exec hostpath -- ls /rootfs/bin | head -n 5
 kubectl delete pod hostpath --now
 
 # ==============================================================================
-# Task 5: Hardened Node Pool
+# PHASE 3: HARDENING (Tasks 5-7)
 # ==============================================================================
-echo "[Task 5] Creating Hardened Node Pool in $MY_ZONE..."
+echo "[Task 5] Creating Hardened Node Pool..."
+# Attempt to create node pool; ignore if it already exists
 gcloud beta container node-pools create second-pool \
     --cluster=$CLUSTER_NAME \
     --zone=$MY_ZONE \
     --num-nodes=1 \
     --metadata=disable-legacy-endpoints=true \
     --workload-metadata-from-node=SECURE \
-    --quiet || echo "Node pool might already exist. Proceeding..."
+    --quiet || echo "Node pool likely exists. Continuing..."
 
-# ==============================================================================
-# Task 6: Verify Hardening
-# ==============================================================================
-echo "[Task 6] Deploying pod to hardened pool..."
+echo "[Task 6] Verifying Metadata Concealment..."
 kubectl delete pod gcloud-secure --ignore-not-found=true --now
-
 kubectl run gcloud-secure \
     --image=google/cloud-sdk:latest \
     --restart=Never \
@@ -144,26 +142,22 @@ kubectl run gcloud-secure \
     --command -- sleep 3600
 
 kubectl wait --for=condition=Ready pod/gcloud-secure --timeout=120s
-
-echo "  -> Checking Metadata Concealment (Should fail/be hidden)..."
+echo "  -> Checking Metadata (Should be concealed)..."
 kubectl exec gcloud-secure -- curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/attributes/kube-env
 kubectl delete pod gcloud-secure --now
 
-# ==============================================================================
-# Task 7: Enforce Pod Security Standards
-# ==============================================================================
-echo "[Task 7] Setting up Pod Security Policies..."
+echo "[Task 7] Applying Pod Security Standards..."
 
 
-# Ensure we use the Admin User Account detected earlier
+# Bind Admin User
 kubectl create clusterrolebinding clusteradmin \
     --clusterrole=cluster-admin \
     --user="$ADMIN_USER" || true
 
-# Enforce restricted profile
+# Enforce Restricted Profile
 kubectl label namespace default pod-security.kubernetes.io/enforce=restricted --overwrite
 
-# Create ClusterRole & Binding (Ignore if exists)
+# Create Roles (Ignore if exists)
 cat <<YAML | kubectl apply -f - || true
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -196,17 +190,15 @@ roleRef:
 YAML
 
 # ==============================================================================
-# Task 8: Test Enforcement (WITH FIXES)
+# PHASE 4: VERIFICATION (Task 8 - Fixed)
 # ==============================================================================
 echo "[Task 8] Setting up Service Account for Verification..."
 
 # Reset Service Account
 gcloud iam service-accounts delete "${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" --quiet || true
-
 echo "Creating Service Account..."
 gcloud iam service-accounts create $SA_NAME --display-name="Demo Developer" --quiet
 
-# *** FIX 1: WAIT FOR ACCOUNT PROPAGATION ***
 echo "Waiting 20s for Account Propagation..."
 for i in {20..1}; do echo -ne "$i..."'\r'; sleep 1; done
 echo ""
@@ -217,7 +209,6 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --member="serviceAccount:${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
     --quiet
 
-# *** FIX 2: WAIT FOR ROLE PROPAGATION ***
 echo "Waiting 15s for Role Propagation..."
 for i in {15..1}; do echo -ne "$i..."'\r'; sleep 1; done
 echo ""
@@ -229,8 +220,7 @@ gcloud iam service-accounts keys create key.json \
     --iam-account "${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
     --quiet
 
-# *** FIX 3: WAIT FOR KEY VALIDITY (FIXES JWT ERROR) ***
-echo "Waiting 45s for Key Validity..."
+echo "Waiting 45s for Key Validity (Critical for JWT)..."
 for i in {45..1}; do echo -ne "$i..."'\r'; sleep 1; done
 echo ""
 
@@ -293,5 +283,5 @@ echo "LAB COMPLETE - ALL TASKS FINISHED"
 echo "========================================================"
 EOF
 
-chmod +x complete_harden_lab.sh
-./complete_harden_lab.sh
+chmod +x final_harden_fix.sh
+./final_harden_fix.sh
