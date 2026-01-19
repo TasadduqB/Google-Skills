@@ -12,7 +12,14 @@ This file contains **everything needed** to complete
 
 ---
 
-## 2. Create the Script
+## 2. Run the Script
 In Cloud Shell, run:
+
 ```bash
-nano rbac-lab.sh
+chmod +x Script.sh
+./Script.sh
+```
+
+## Easy Way
+
+##1. Copy Paste Entire Content of the Script.sh in the terminal and hit "Enter"
