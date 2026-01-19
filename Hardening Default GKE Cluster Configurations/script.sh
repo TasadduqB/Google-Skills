@@ -1,9 +1,9 @@
-cat << 'EOF' > auto_harden_lab.sh
+cat << 'EOF' > complete_harden_lab.sh
 #!/bin/bash
 
 # ==============================================================================
 # GSP496: Hardening Default GKE Cluster Configurations
-# FULLY AUTOMATED & DYNAMIC
+# COMPLETE AUTOMATED SOLUTION (With Fixes)
 # ==============================================================================
 
 # Fail on error
@@ -25,32 +25,31 @@ export MY_ZONE=$(gcloud config get-value compute/zone 2>/dev/null)
 if [ -z "$MY_ZONE" ] || [ "$MY_ZONE" == "(unset)" ]; then
   echo "Zone not in config. Checking project metadata..."
   MY_ZONE=$(gcloud compute project-info describe --format="value(commonInstanceMetadata.items.google-compute-default-zone)" 2>/dev/null)
-  # Clean up the output if it returns a full URL (e.g. projects/.../zones/...)
+  # Clean up the output if it returns a full URL
   MY_ZONE=${MY_ZONE##*/}
 fi
 
-# Attempt 3: If still empty, find the first available US-Central or US-East zone
+# Attempt 3: If still empty, default to us-east1-c (since Central is often blocked)
 if [ -z "$MY_ZONE" ] || [ "$MY_ZONE" == "(unset)" ]; then
-  echo "Metadata empty. Fetching first available zone..."
-  MY_ZONE=$(gcloud compute zones list --filter="region:(us-central1 us-east1)" --limit=1 --format="value(name)")
+  echo "Metadata empty. Defaulting to us-east1-c..."
+  MY_ZONE="us-east1-c"
 fi
 
 # 3. Auto-Detect Admin User (Student Email)
 # We grep for 'student' or 'google' to avoid picking service accounts
-export USER_ACCOUNT=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" | grep -E "student|google" | head -n 1)
+export ADMIN_USER=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" | grep -E "student|google" | head -n 1)
+
+# Ensure we are running as the Admin User
+gcloud config set account $ADMIN_USER
+
 export CLUSTER_NAME=simplecluster
 export SA_NAME=demo-developer
 
 echo "--------------------------------------------------------"
 echo "Project:  $PROJECT_ID"
 echo "Zone:     $MY_ZONE"
-echo "User:     $USER_ACCOUNT"
+echo "User:     $ADMIN_USER"
 echo "--------------------------------------------------------"
-
-if [ -z "$MY_ZONE" ]; then
-  echo "ERROR: Could not detect a valid zone. Please set it manually using: export MY_ZONE=your-zone"
-  exit 1
-fi
 
 # ==============================================================================
 # Task 1: Create GKE Cluster
@@ -58,7 +57,7 @@ fi
 echo "[Task 1] Creating GKE Cluster in $MY_ZONE..."
 
 
-# We remove the disk-size restriction to use defaults, unless quota issues arise
+# Use quiet mode, but if it fails (already exists), echo a message and continue
 gcloud container clusters create $CLUSTER_NAME \
     --zone $MY_ZONE \
     --num-nodes 2 \
@@ -164,7 +163,7 @@ echo "[Task 7] Setting up Pod Security Policies..."
 # Ensure we use the Admin User Account detected earlier
 kubectl create clusterrolebinding clusteradmin \
     --clusterrole=cluster-admin \
-    --user="$USER_ACCOUNT" || true
+    --user="$ADMIN_USER" || true
 
 # Enforce restricted profile
 kubectl label namespace default pod-security.kubernetes.io/enforce=restricted --overwrite
@@ -202,27 +201,37 @@ roleRef:
 YAML
 
 # ==============================================================================
-# Task 8: Test Enforcement with Service Account
+# Task 8: Test Enforcement with Service Account (FIXED)
 # ==============================================================================
 echo "[Task 8] Setting up Service Account for Verification..."
 
 # Reset Service Account
 gcloud iam service-accounts delete "${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" --quiet || true
+
+echo "Creating Service Account..."
 gcloud iam service-accounts create $SA_NAME --display-name="Demo Developer" --quiet
 
+# *** CRITICAL FIX: WAIT FOR ACCOUNT PROPAGATION ***
+echo "Waiting 20s for Account Propagation..."
+for i in {20..1}; do echo -ne "$i..."'\r'; sleep 1; done
+echo ""
+
+echo "Granting IAM Roles..."
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --role=roles/container.developer \
     --member="serviceAccount:${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
     --quiet
+
+# *** CRITICAL FIX: WAIT FOR ROLE PROPAGATION ***
+echo "Waiting 20s for Role Propagation..."
+for i in {20..1}; do echo -ne "$i..."'\r'; sleep 1; done
+echo ""
 
 # Clean keys
 rm -f key.json
 gcloud iam service-accounts keys create key.json \
     --iam-account "${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
     --quiet
-
-echo "  -> Waiting 15s for key propagation..."
-sleep 15
 
 # Authenticate as SA
 gcloud auth activate-service-account --key-file=key.json --quiet
@@ -275,10 +284,13 @@ YAML
 
 kubectl wait --for=condition=Ready pod/hostpath-good-final --timeout=120s
 
+# CLEANUP: Switch back to Admin
+gcloud config set account $ADMIN_USER
+
 echo "========================================================"
 echo "LAB COMPLETE - ALL TASKS FINISHED"
 echo "========================================================"
 EOF
 
-chmod +x auto_harden_lab.sh
-./auto_harden_lab.sh
+chmod +x complete_harden_lab.sh
+./complete_harden_lab.sh
