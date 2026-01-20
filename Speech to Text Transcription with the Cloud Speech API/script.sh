@@ -1,5 +1,5 @@
 # 1. Export your API Key
-export API_KEY=AIzaSyB-CIY4kEhB5ZEQVpTcwzdkUAbRdqfbrCo
+export API_KEY="key"
 
 # --- TASK 2 & 3: English Transcription ---
 echo "Processing English Transcription..."
